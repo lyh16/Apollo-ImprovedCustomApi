@@ -1,0 +1,219 @@
+name: Build patched Apollo IPA
+
+# Polls JeffreyCA/Apollo-ImprovedCustomApi for the latest published release,
+# downloads its rootless .deb, injects it into a host Apollo.ipa via pyzule-rw,
+# and publishes the resulting .ipa as a release on this fork.
+#
+# Adapted from Balackburn/Apollo's create_release.yml, with the upstream API
+# response validated before jq touches `.assets` (the original would crash with
+# `jq: Cannot iterate over null (null)` whenever the API returned an error
+# JSON, e.g. rate limit, transient 404, or a draft-only release window).
+
+on:
+  workflow_dispatch:
+    inputs:
+      apollo_ipa_url:
+        description: 'Apollo .ipa URL'
+        required: false
+        default: 'https://files.catbox.moe/o2lue0.ipa'
+      force_build:
+        description: 'Build even if no new upstream release'
+        type: boolean
+        default: false
+      draft:
+        description: 'Publish as a draft release (scheduled runs always publish non-draft)'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: '3.13'
+  APOLLO_IPA_URL: ${{ inputs.apollo_ipa_url || 'https://files.catbox.moe/o2lue0.ipa' }}
+  UPSTREAM_REPO: 'JeffreyCA/Apollo-ImprovedCustomApi'
+  PYZULE_RW_URL: 'https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip'
+
+jobs:
+  poll-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.poll.outputs.should_build }}
+      release_tag:  ${{ steps.poll.outputs.release_tag }}
+      deb_url:      ${{ steps.poll.outputs.deb_url }}
+      release_body: ${{ steps.poll.outputs.release_body }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Poll upstream for latest release
+        id: poll
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force_build }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_API="https://api.github.com/repos/${UPSTREAM_REPO}"
+
+          # Fetch /releases/latest, retrying on transient failures.
+          # /latest returns 404 if all releases are drafts/prereleases, and 403
+          # for rate-limit. Either way the body has no .assets, so we MUST
+          # validate before piping to jq.
+          attempt=0
+          while :; do
+              attempt=$((attempt+1))
+              STATUS=$(curl -sS -o response.json -w '%{http_code}' \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "$UPSTREAM_API/releases/latest" || echo "000")
+              echo "Attempt $attempt: HTTP $STATUS"
+
+              if [ "$STATUS" = "200" ]; then
+                  break
+              fi
+
+              if [ "$STATUS" = "404" ]; then
+                  # Fall back to scanning the releases list for the most recent
+                  # published (non-draft, non-prerelease) release.
+                  echo "No /releases/latest available, scanning /releases list…"
+                  FALLBACK_STATUS=$(curl -sS -o response.json -w '%{http_code}' \
+                    -H "Authorization: token $GH_TOKEN" \
+                    -H "Accept: application/vnd.github+json" \
+                    "$UPSTREAM_API/releases?per_page=20")
+                  if [ "$FALLBACK_STATUS" = "200" ]; then
+                      jq '[ .[] | select(.draft == false and .prerelease == false) ][0] // empty' \
+                          response.json > picked.json
+                      if [ -s picked.json ]; then
+                          mv picked.json response.json
+                          break
+                      fi
+                  fi
+                  echo "::warning::No published upstream release found; skipping build."
+                  echo "should_build=false" >> "$GITHUB_OUTPUT"
+                  exit 0
+              fi
+
+              if [ "$attempt" -ge 5 ]; then
+                  echo "::error::Upstream poll failed after $attempt attempts (HTTP $STATUS)."
+                  echo "Response body:"
+                  cat response.json || true
+                  exit 1
+              fi
+              sleep $((2 ** attempt))
+          done
+
+          # Shape check: anything other than a release object means an error body
+          # slipped through. Bail out with the actual message instead of a jq trace.
+          if [ "$(jq -r 'type' response.json)" != "object" ] \
+              || [ "$(jq -r '.assets | type' response.json)" != "array" ]; then
+              echo "::error::Unexpected response from upstream API:"
+              cat response.json
+              exit 1
+          fi
+
+          RELEASE_TAG=$(jq -r '.tag_name' response.json)
+          RELEASE_BODY=$(jq -r '.body // ""' response.json)
+          DEB_URL=$(jq -r '.assets[]
+              | select(.name | test("iphoneos-arm64_rootless\\.deb$"))
+              | .browser_download_url' response.json)
+
+          if [ -z "$DEB_URL" ] || [ "$DEB_URL" = "null" ]; then
+              echo "::error::Release $RELEASE_TAG has no iphoneos-arm64_rootless.deb asset."
+              exit 1
+          fi
+
+          echo "Upstream release: $RELEASE_TAG"
+          echo "DEB URL:          $DEB_URL"
+
+          # Skip the build if this fork already published an IPA for the
+          # current upstream version (unless force_build was requested).
+          should_build=true
+          if [ "${FORCE:-false}" != "true" ]; then
+              CURRENT_TAG=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+                  "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+                  | jq -r '.tag_name // empty')
+              UPSTREAM_VER=$(echo "$RELEASE_TAG" | sed -nE 's/v(.+)/\1/p')
+              CURRENT_VER=$(echo "$CURRENT_TAG" | sed -nE 's/.*_v?(.+)/\1/p')
+              if [ -n "$CURRENT_VER" ] && [ "$UPSTREAM_VER" = "$CURRENT_VER" ]; then
+                  echo "This fork already has a release for upstream $RELEASE_TAG; nothing to do."
+                  should_build=false
+              fi
+          fi
+
+          {
+              echo "should_build=$should_build"
+              echo "release_tag=$RELEASE_TAG"
+              echo "deb_url=$DEB_URL"
+              echo "release_body<<__EOF__"
+              echo "$RELEASE_BODY"
+              echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: poll-upstream
+    if: needs.poll-upstream.outputs.should_build == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pyzule-rw and ldid
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+          pip install --force-reinstall "${{ env.PYZULE_RW_URL }}"
+          brew install ldid
+
+      - name: Download Apollo.ipa and tweak .deb
+        env:
+          DEB_URL: ${{ needs.poll-upstream.outputs.deb_url }}
+        run: |
+          curl -L --fail "$APOLLO_IPA_URL" -o Apollo.ipa
+          curl -L --fail "$DEB_URL" -o improvedcustomapi.deb
+
+          APOLLO_VERSION=$(unzip -p Apollo.ipa 'Payload/*.app/Info.plist' \
+              | grep -A1 CFBundleShortVersionString \
+              | grep '<string>' | sed -E 's@.*<string>(.*)</string>.*@\1@' \
+              | tr -d '[:space:]')
+          echo "APOLLO_VERSION=$APOLLO_VERSION" >> "$GITHUB_ENV"
+
+      - name: Inject tweak with pyzule-rw
+        env:
+          RELEASE_TAG: ${{ needs.poll-upstream.outputs.release_tag }}
+        run: |
+          ICA_VERSION=$(echo "$RELEASE_TAG" | sed -nE 's/v(.+)/\1/p')
+          OUT_NAME="Apollo-${APOLLO_VERSION}_ImprovedCustomApi-${ICA_VERSION}.ipa"
+
+          cyan -i Apollo.ipa -o "$OUT_NAME" -f improvedcustomapi.deb --fakesign
+
+          echo "ICA_VERSION=$ICA_VERSION" >> "$GITHUB_ENV"
+          echo "OUT_NAME=$OUT_NAME" >> "$GITHUB_ENV"
+
+      - name: Write release notes
+        env:
+          RELEASE_TAG:  ${{ needs.poll-upstream.outputs.release_tag }}
+          RELEASE_BODY: ${{ needs.poll-upstream.outputs.release_body }}
+        run: |
+          {
+              echo "Apollo version: \`v${APOLLO_VERSION}\`"
+              echo "ImprovedCustomApi version: \`${RELEASE_TAG}\`"
+              echo ""
+              echo "## Upstream release notes"
+              echo "${RELEASE_BODY}"
+          } > RELEASE_NOTES.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.APOLLO_VERSION }}_${{ env.ICA_VERSION }}
+          name: Apollo v${{ env.APOLLO_VERSION }} + ImprovedCustomApi ${{ needs.poll-upstream.outputs.release_tag }}
+          body_path: RELEASE_NOTES.md
+          files: ${{ env.OUT_NAME }}
+          # Scheduled runs have no `inputs` context, so this is `false` on cron
+          # and only becomes `true` when a manual dispatch ticks the box.
+          draft: ${{ inputs.draft || false }}
