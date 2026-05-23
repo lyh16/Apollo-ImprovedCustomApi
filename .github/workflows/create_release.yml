@@ -60,11 +60,12 @@ jobs:
           # Fetch /releases/latest, retrying on transient failures.
           # /latest returns 404 if all releases are drafts/prereleases, and 403
           # for rate-limit. Either way the body has no .assets, so we MUST
-          # validate before piping to jq.
+          # validate before piping to jq. `-L` follows the 301 GitHub serves
+          # when the upstream repo is renamed or transferred.
           attempt=0
           while :; do
               attempt=$((attempt+1))
-              STATUS=$(curl -sS -o response.json -w '%{http_code}' \
+              STATUS=$(curl -sSL -o response.json -w '%{http_code}' \
                 -H "Authorization: token $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "$UPSTREAM_API/releases/latest" || echo "000")
@@ -78,7 +79,7 @@ jobs:
                   # Fall back to scanning the releases list for the most recent
                   # published (non-draft, non-prerelease) release.
                   echo "No /releases/latest available, scanning /releases list…"
-                  FALLBACK_STATUS=$(curl -sS -o response.json -w '%{http_code}' \
+                  FALLBACK_STATUS=$(curl -sSL -o response.json -w '%{http_code}' \
                     -H "Authorization: token $GH_TOKEN" \
                     -H "Accept: application/vnd.github+json" \
                     "$UPSTREAM_API/releases?per_page=20")
@@ -131,7 +132,7 @@ jobs:
           # current upstream version (unless force_build was requested).
           should_build=true
           if [ "${FORCE:-false}" != "true" ]; then
-              CURRENT_TAG=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+              CURRENT_TAG=$(curl -sSL -H "Authorization: token $GH_TOKEN" \
                   "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
                   | jq -r '.tag_name // empty')
               UPSTREAM_VER=$(echo "$RELEASE_TAG" | sed -nE 's/v(.+)/\1/p')
