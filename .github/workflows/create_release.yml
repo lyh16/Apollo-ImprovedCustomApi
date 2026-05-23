@@ -20,6 +20,10 @@ on:
         description: 'Build even if no new upstream release'
         type: boolean
         default: false
+      draft:
+        description: 'Publish as a draft release (scheduled runs always publish non-draft)'
+        type: boolean
+        default: false
   schedule:
     - cron: '0 */6 * * *'
 
@@ -210,3 +214,6 @@ jobs:
           name: Apollo v${{ env.APOLLO_VERSION }} + ImprovedCustomApi ${{ needs.poll-upstream.outputs.release_tag }}
           body_path: RELEASE_NOTES.md
           files: ${{ env.OUT_NAME }}
+          # Scheduled runs have no `inputs` context, so this is `false` on cron
+          # and only becomes `true` when a manual dispatch ticks the box.
+          draft: ${{ inputs.draft || false }}
