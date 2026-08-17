@@ -130,14 +130,21 @@ jobs:
 
           # Skip the build if this fork already published an IPA for the
           # current upstream version (unless force_build was requested).
+          #
+          # Compare only the trailing `_`-token (the tweak version, e.g.
+          # 3.5.1): upstream's Apollo-Reborn-era tags embed the Apollo version
+          # too (v1.15.11_3.5.1), and this fork's historical tags exist in
+          # both v<apollo>_<tweak> and doubled v<apollo>_<apollo>_<tweak>
+          # shapes, so full-string comparison never matched and every
+          # scheduled run re-published (and re-uploaded) the same release.
           should_build=true
           if [ "${FORCE:-false}" != "true" ]; then
               CURRENT_TAG=$(curl -sSL -H "Authorization: token $GH_TOKEN" \
                   "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
                   | jq -r '.tag_name // empty')
-              UPSTREAM_VER=$(echo "$RELEASE_TAG" | sed -nE 's/v(.+)/\1/p')
-              CURRENT_VER=$(echo "$CURRENT_TAG" | sed -nE 's/.*_v?(.+)/\1/p')
-              if [ -n "$CURRENT_VER" ] && [ "$UPSTREAM_VER" = "$CURRENT_VER" ]; then
+              UPSTREAM_TWEAK_VER=${RELEASE_TAG#v}; UPSTREAM_TWEAK_VER=${UPSTREAM_TWEAK_VER##*_}
+              CURRENT_TWEAK_VER=${CURRENT_TAG#v}; CURRENT_TWEAK_VER=${CURRENT_TWEAK_VER##*_}
+              if [ -n "$CURRENT_TWEAK_VER" ] && [ "$UPSTREAM_TWEAK_VER" = "$CURRENT_TWEAK_VER" ]; then
                   echo "This fork already has a release for upstream $RELEASE_TAG; nothing to do."
                   should_build=false
               fi
@@ -188,6 +195,10 @@ jobs:
           RELEASE_TAG: ${{ needs.poll-upstream.outputs.release_tag }}
         run: |
           ICA_VERSION=$(echo "$RELEASE_TAG" | sed -nE 's/v(.+)/\1/p')
+          # Upstream Apollo-Reborn-era tags embed the Apollo version
+          # (v1.15.11_3.5.1); strip that prefix so our own tag and filename
+          # don't double it (v1.15.11_1.15.11_3.5.1).
+          ICA_VERSION=${ICA_VERSION#"${APOLLO_VERSION}_"}
           OUT_NAME="Apollo-${APOLLO_VERSION}_ImprovedCustomApi-${ICA_VERSION}.ipa"
 
           cyan -i Apollo.ipa -o "$OUT_NAME" -f improvedcustomapi.deb --fakesign
